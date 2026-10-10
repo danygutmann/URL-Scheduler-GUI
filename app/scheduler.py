@@ -1,9 +1,9 @@
 import logging
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.executors.pool import ThreadPoolExecutor as APSchedulerThreadPoolExecutor
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger
@@ -57,7 +57,7 @@ class JobScheduler:
     def __init__(self):
         self.scheduler = BackgroundScheduler(
             timezone=ZoneInfo(settings.timezone),
-            executors={"default": ThreadPoolExecutor(max_workers=settings.max_concurrent_jobs)},
+            executors={"default": APSchedulerThreadPoolExecutor(max_workers=settings.max_concurrent_jobs)},
             job_defaults={"coalesce": True, "misfire_grace_time": 1, "max_instances": 1},
         )
 

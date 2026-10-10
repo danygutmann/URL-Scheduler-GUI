@@ -275,11 +275,40 @@ def _job_form(job: Job | None):
         {"interval": "Intervall", "cron": "Cron", "once": "Einmalig"},
         label="Zeitplantyp", value=defaults["schedule_type"],
     )
-    schedule_config = ui.textarea(
-        "Zeitplan-Konfiguration (JSON)",
-        value=defaults["schedule_config"],
-        placeholder='Intervall: {"value":5,"unit":"minutes"}; Cron: {"expression":"0 8 * * 1"}; Einmalig: {"run_at":"2026-12-24T08:00:00"}',
+    config = job.schedule_config if job else {"value": 5, "unit": "minutes"}
+    with ui.column().classes("w-full"):
+        interval_controls = ui.row().classes("w-full")
+        with interval_controls:
+            interval_value = ui.number("Intervall", value=int(config.get("value", 5)), min=1)
+            interval_unit = ui.select(
+                {"seconds": "Sekunden", "minutes": "Minuten", "hours": "Stunden", "days": "Tage"},
+                label="Einheit", value=config.get("unit", "minutes"),
+            )
+        cron_expression = ui.input(
+            "Cron-Ausdruck (Minute Stunde Tag Monat Wochentag)",
+            value=config.get("expression", "0 8 * * 1"),
+        ).classes("w-full")
+        once_at = ui.input(
+            "Ausführungszeitpunkt (ISO 8601)",
+            value=config.get("run_at", ""),
+            placeholder="2026-12-24T08:00:00",
+        ).classes("w-full")
+    interval_start = ui.input(
+        "Startzeitpunkt optional (ISO 8601)", value=config.get("start_at", "")
     ).classes("w-full")
+    interval_end = ui.input(
+        "Enddatum optional (ISO 8601)", value=config.get("end_at", "")
+    ).classes("w-full")
+
+    def update_schedule_fields():
+        interval_controls.set_visibility(schedule_type.value == "interval")
+        interval_start.set_visibility(schedule_type.value != "once")
+        interval_end.set_visibility(schedule_type.value != "once")
+        cron_expression.set_visibility(schedule_type.value == "cron")
+        once_at.set_visibility(schedule_type.value == "once")
+
+    schedule_type.on_value_change(lambda _event: update_schedule_fields())
+    update_schedule_fields()
     timezone = ui.input("Zeitzone", value=defaults["timezone"])
     enabled = ui.checkbox("Aktiviert", value=defaults["enabled"])
     allow_parallel = ui.checkbox("Parallele Ausführungen erlauben", value=defaults["allow_parallel"])
@@ -294,13 +323,24 @@ def _job_form(job: Job | None):
         retry_config = ui.input("Wiederholungsoptionen (JSON)", value=defaults["retry_config"]).classes("w-full")
     def save():
         try:
+            if schedule_type.value == "interval":
+                schedule_config = {"value": interval_value.value, "unit": interval_unit.value}
+            elif schedule_type.value == "cron":
+                schedule_config = {"expression": cron_expression.value}
+            else:
+                schedule_config = {"run_at": once_at.value}
+            if schedule_type.value != "once":
+                if interval_start.value:
+                    schedule_config["start_at"] = interval_start.value
+                if interval_end.value:
+                    schedule_config["end_at"] = interval_end.value
             data = _job_input({
                 "name": name.value,
                 "description": description.value,
                 "url": url.value,
                 "method": method.value,
                 "schedule_type": schedule_type.value,
-                "schedule_config": schedule_config.value,
+                "schedule_config": __import__("json").dumps(schedule_config),
                 "timezone": timezone.value,
                 "headers": headers.value,
                 "query_params": query_params.value,
