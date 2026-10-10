@@ -35,8 +35,13 @@ def trigger_for(job: Job):
             end_date=end_date,
         )
     if job.schedule_type == "cron":
-        return CronTrigger.from_crontab(
-            config["expression"], timezone=zone, start_date=start_date, end_date=end_date
+        fields = config["expression"].split()
+        if len(fields) != 5:
+            raise ValueError("Cron-Ausdrücke müssen fünf Felder enthalten.")
+        return CronTrigger(
+            minute=fields[0], hour=fields[1], day=fields[2],
+            month=fields[3], day_of_week=fields[4], timezone=zone,
+            start_date=start_date, end_date=end_date,
         )
     return DateTrigger(run_date=_local_datetime(config["run_at"], zone), timezone=zone)
 

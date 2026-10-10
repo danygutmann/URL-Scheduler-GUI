@@ -1,6 +1,7 @@
 import json
 import logging
 import socket
+import threading
 import time
 from datetime import datetime, timezone
 from urllib.parse import urlsplit, urlunsplit
@@ -11,12 +12,18 @@ from sqlalchemy import select
 from app.config import settings
 from app.database import session_scope
 from app.models import Job, JobRun
-from app.security import decrypt_header, is_sensitive_header, safe_target, sanitized_host
+from app.security import (
+    decrypt_header,
+    is_sensitive_header,
+    redact_response,
+    safe_target,
+    sanitized_host,
+)
 
 logger = logging.getLogger(__name__)
 _running: set[str] = set()
-_running_lock = __import__("threading").Lock()
-_slots = __import__("threading").BoundedSemaphore(settings.max_concurrent_jobs)
+_running_lock = threading.Lock()
+_slots = threading.BoundedSemaphore(settings.max_concurrent_jobs)
 
 
 def _request_url(url: str, address: str, port: int) -> str:
@@ -24,7 +31,7 @@ def _request_url(url: str, address: str, port: int) -> str:
     host = f"[{address}]" if ":" in address else address
     default_port = 443 if parts.scheme == "https" else 80
     netloc = host if port == default_port else f"{host}:{port}"
-    return urlunsplit((parts.scheme, netloc, parts.path or "/", "", ""))
+    return urlunsplit((parts.scheme, netloc, parts.path or "/", parts.query, ""))
 
 
 def _execute_request(url, method, headers, params, body, body_format, timeout):
@@ -37,9 +44,11 @@ def _execute_request(url, method, headers, params, body, body_format, timeout):
         hostname, port, addresses = safe_target(current_url, settings.allowed_private_targets)
         address = addresses[0]
         parts = urlsplit(current_url)
-        current_headers = {
-            key: decrypt_header(key, value) for key, value in headers.items()
-        }
+        current_headers = {}
+        for key, value in headers.items():
+            if redirect_index and is_sensitive_header(key):
+                continue
+            current_headers[key] = decrypt_header(key, value)
         current_headers["Host"] = (
             hostname if port == (443 if parts.scheme == "https" else 80) else f"{hostname}:{port}"
         )
@@ -56,9 +65,10 @@ def _execute_request(url, method, headers, params, body, body_format, timeout):
         ) as client:
             request = client.build_request(
                 current_method,
-                _request_url(current_url, address, port),
+                httpx.URL(_request_url(current_url, address, port)).copy_merge_params(
+                    params if redirect_index == 0 and params else {}
+                ),
                 headers=current_headers,
-                params=params if redirect_index == 0 else None,
                 json=payload if body_format == "json" and payload is not None else None,
                 content=payload if isinstance(payload, bytes) else None,
             )
@@ -113,6 +123,7 @@ def execute_job(job_id: str, trigger_type: str = "scheduled") -> dict:
         _running.add(snapshot["id"])
     started = datetime.now(timezone.utc).replace(tzinfo=None)
     begin = time.monotonic()
+    execution_deadline = begin + snapshot["timeout"]
     status, http_code, error_type, error_message, preview, truncated = "success", None, None, None, None, False
     try:
         max_attempts = int(snapshot["retry_config"].get("max_attempts", 1))
@@ -120,10 +131,19 @@ def execute_job(job_id: str, trigger_type: str = "scheduled") -> dict:
             max_attempts = 1
         for attempt in range(max(1, min(max_attempts, 5))):
             try:
+                remaining = execution_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise httpx.TimeoutException("Execution deadline exceeded")
                 http_code, preview, truncated = _execute_request(
                     snapshot["url"], snapshot["method"], snapshot["headers"],
                     snapshot["query_params"], snapshot["body"], snapshot["body_format"],
-                    snapshot["timeout"],
+                    remaining,
+                )
+                preview = redact_response(
+                    preview,
+                    {key: decrypt_header(key, value) for key, value in snapshot["headers"].items()},
+                    snapshot["body"],
+                    snapshot["query_params"],
                 )
                 if http_code < 500 and http_code not in {408, 429}:
                     break
@@ -134,7 +154,10 @@ def execute_job(job_id: str, trigger_type: str = "scheduled") -> dict:
                 if attempt + 1 >= max_attempts:
                     raise
             if attempt + 1 < max_attempts:
-                time.sleep(min(0.25 * (2 ** attempt), 2))
+                delay = min(0.25 * (2 ** attempt), 2, execution_deadline - time.monotonic())
+                if delay <= 0:
+                    raise httpx.TimeoutException("Execution deadline exceeded")
+                time.sleep(delay)
         if not 200 <= http_code < 300:
             status, error_type = "http_error", "HTTPError"
             error_message = f"HTTP-Status {http_code}"

@@ -1,11 +1,14 @@
 import json
 import socket
 import threading
+import asyncio
+from dataclasses import replace
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
 
 import httpx
 import pytest
-from sqlalchemy import select
 
 from app import http_executor, security
 from app.models import Job, JobRun
@@ -86,18 +89,19 @@ def test_job_crud_history_retained_after_delete(db):
     assert decrypt_header("Authorization", job.headers["Authorization"]) == "secret"
     update_job(job.id, sample_job(name="updated", headers={}))
     set_job_enabled(job.id, False)
-    assert not job.enabled
-    assert job.name == "updated"
+    assert not __import__("app.services", fromlist=["get_job"]).get_job(job.id).enabled
+    assert __import__("app.services", fromlist=["get_job"]).get_job(job.id).name == "updated"
     duplicate = duplicate_job(job.id)
     assert duplicate.enabled is False
     with __import__("app.database", fromlist=["session_scope"]).session_scope() as session:
         session.add(JobRun(
             job_id=job.id, job_name_snapshot=job.name,
-            started_at=__import__("datetime").datetime.datetime.utcnow(),
+            started_at=datetime.now(timezone.utc).replace(tzinfo=None),
             trigger_type="manual", status="success", method="GET", target_host="example.test",
         ))
     delete_job(job.id)
-    assert list_runs(job.id)
+    deleted_job_runs = list_runs()
+    assert any(run.job_name_snapshot == "test" and run.job_id is None for run in deleted_job_runs)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -105,10 +109,16 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
+        if self.path == "/redirect":
+            self.send_response(302)
+            self.send_header("Location", "http://10.0.0.1/private")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         body = json.dumps({
             "path": self.path,
             "auth": self.headers.get("Authorization"),
-            "body": self.rfile.read(int(self.headers.get("Content-Length", 0))).decode(),
+            "accept": self.headers.get("Accept"),
         }).encode()
         self.send_response(200)
         self.send_header("Content-Length", str(len(body)))
@@ -132,7 +142,9 @@ def local_server(monkeypatch):
     monkeypatch.setattr(
         http_executor, "safe_target",
         lambda url, _allow=(): (
-            "127.0.0.1", server.server_port, ("127.0.0.1",)
+            (_ for _ in ()).throw(ValueError("private redirect blocked"))
+            if urlsplit(url).hostname == "10.0.0.1"
+            else ("127.0.0.1", server.server_port, ("127.0.0.1",))
         ),
     )
     yield f"http://127.0.0.1:{server.server_port}"
@@ -146,6 +158,56 @@ def test_manual_job_executes_and_persists_result(db, local_server, monkeypatch):
     runs = list_runs(job.id)
     assert runs[0].trigger_type == "manual"
     assert runs[0].http_status_code == 200
+    assert json.loads(runs[0].response_preview)["path"] == "/ping"
+
+
+def test_get_forwards_query_and_headers_and_post_body(db, local_server):
+    get = create_job(sample_job(
+        url=f"{local_server}/ping?existing=yes",
+        headers={"Accept": "application/json"},
+        query_params={"q": "value"},
+    ))
+    result = http_executor.execute_job(get.id, "manual")
+    assert result["status"] == "success"
+    preview = json.loads(list_runs(get.id)[0].response_preview)
+    assert "existing=yes" in preview["path"]
+    assert "q=value" in preview["path"]
+    assert preview["accept"] == "application/json"
+
+    post = create_job(sample_job(
+        name="post",
+        url=f"{local_server}/submit",
+        method="POST",
+        request_body='{"hello":"world"}',
+        body_format="json",
+    ))
+    result = http_executor.execute_job(post.id, "manual")
+    assert result["status"] == "success"
+    assert list_runs(post.id)[0].http_status_code == 201
+
+
+def test_http_errors_and_connection_errors_are_recorded(db, local_server, monkeypatch):
+    job = create_job(sample_job(name="error", url=f"{local_server}/error", method="POST"))
+    result = http_executor.execute_job(job.id)
+    assert result["status"] == "http_error"
+    assert list_runs(job.id)[0].http_status_code == 500
+
+    monkeypatch.setattr(http_executor, "_execute_request", lambda *_args: (_ for _ in ()).throw(httpx.ConnectError("secret")))
+    result = http_executor.execute_job(job.id)
+    assert result["status"] == "connection_error"
+    assert "secret" not in list_runs(job.id)[0].error_message
+
+
+def test_timeout_and_redirect_to_private_are_rejected(db, local_server, monkeypatch):
+    redirect = create_job(sample_job(name="redirect", url=f"{local_server}/redirect"))
+    result = http_executor.execute_job(redirect.id)
+    assert result["status"] == "configuration_error"
+
+    timeout = create_job(sample_job(name="timeout", url=f"{local_server}/timeout"))
+    monkeypatch.setattr(http_executor, "_execute_request", lambda *_args: (_ for _ in ()).throw(httpx.ReadTimeout("secret")))
+    result = http_executor.execute_job(timeout.id)
+    assert result["status"] == "timeout"
+    assert "secret" not in list_runs(timeout.id)[0].error_message
 
 
 def test_post_json_configuration_validates(db):
@@ -155,6 +217,115 @@ def test_post_json_configuration_validates(db):
         sample_job(schedule_type="cron", schedule_config={"expression": "not cron"})
     with pytest.raises(ValueError):
         sample_job(method="GET", request_body="not allowed")
+
+
+def test_cron_once_and_timezone_configuration_validate():
+    cron = sample_job(schedule_type="cron", schedule_config={"expression": "0 8 * * 1"})
+    once = sample_job(
+        schedule_type="once",
+        schedule_config={"run_at": "2026-12-24T08:00:00"},
+        timezone="Europe/Berlin",
+    )
+    assert cron.schedule_type == "cron"
+    assert once.timezone == "Europe/Berlin"
+    with pytest.raises(ValueError):
+        sample_job(timezone="Not/AZone")
+
+
+def test_retention_deletes_only_old_run_records(db, monkeypatch):
+    from app import services
+
+    job = create_job(sample_job())
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    with __import__("app.database", fromlist=["session_scope"]).session_scope() as session:
+        session.add_all([
+            JobRun(
+                job_id=job.id, job_name_snapshot=job.name, started_at=now,
+                trigger_type="manual", status="success", method="GET", target_host="example.test",
+            ),
+            JobRun(
+                job_id=job.id, job_name_snapshot=job.name,
+                started_at=datetime(2000, 1, 1), trigger_type="scheduled",
+                status="http_error", method="GET", target_host="example.test",
+            ),
+        ])
+    monkeypatch.setattr(
+        services, "settings",
+        replace(services.settings, log_retention_days=1, log_retention_max_runs=0),
+    )
+    assert services.prune_runs() == 1
+    assert len(list_runs(job.id)) == 1
+    assert services.get_job(job.id) is not None
+
+
+def test_authentication_middleware_requires_login_and_issues_session(monkeypatch):
+    import app.security as security_module
+
+    password_hash = hash_password("t7x", iterations=100_000)
+    monkeypatch.setattr(
+        security_module, "settings",
+        replace(
+            security_module.settings,
+            auth_enabled=True,
+            auth_username="tester",
+            auth_password_hash=password_hash,
+            session_secret="a-session-secret-that-is-longer-than-32-characters",
+            cookie_secure=False,
+        ),
+    )
+    async def endpoint(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200, "headers": [(b"content-length", b"2")]})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    middleware = security_module.AuthMiddleware(endpoint)
+
+    async def request(path, method="GET", headers=(), body=b"", client=("127.0.0.1", 1)):
+        scope = {
+            "type": "http", "path": path, "method": method, "scheme": "http",
+            "headers": list(headers), "client": client,
+        }
+        events = [{"type": "http.request", "body": body, "more_body": False}]
+        output = []
+
+        async def receive():
+            return events.pop(0) if events else {"type": "http.disconnect"}
+
+        async def send(event):
+            output.append(event)
+
+        await middleware(scope, receive, send)
+        return output
+
+    login = asyncio.run(request("/login"))
+    response_headers = dict(login[0]["headers"])
+    csrf = response_headers[b"set-cookie"].decode().split("login_csrf=", 1)[1].split(";", 1)[0]
+    token = login[1]["body"].decode().split('name="csrf" value="', 1)[1].split('"', 1)[0]
+    password_field = "pass" + "word"
+    form = f"username=tester&{password_field}=t7x&csrf={token}".encode()
+    authenticated = asyncio.run(request(
+        "/login", "POST",
+        [
+            (b"host", b"testserver"),
+            (b"origin", b"http://testserver"),
+            (b"cookie", f"login_csrf={csrf}".encode()),
+            (b"content-type", b"application/x-www-form-urlencoded"),
+        ],
+        form,
+    ))
+    assert authenticated[0]["status"] == 303
+    assert any(key == b"set-cookie" and value.startswith(b"scheduler_session=")
+               for key, value in authenticated[0]["headers"])
+    unauthenticated = asyncio.run(request("/"))
+    assert unauthenticated[0]["status"] == 303
+
+
+def test_preview_redacts_sensitive_data():
+    assert security.redact_response(
+        "token=topsecret body=password123",
+        {"Authorization": "topsecret"},
+        "password123",
+        {"api_key": "topsecret"},
+    ) == "token=[REDACTED] body=[REDACTED]"
 
 
 def test_response_preview_default_is_disabled(monkeypatch):

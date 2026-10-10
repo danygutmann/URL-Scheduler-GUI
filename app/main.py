@@ -11,7 +11,7 @@ from app.http_executor import execute_job
 from app.models import Job
 from app.scheduler import scheduler
 from app.schemas import JobInput
-from app.security import AuthMiddleware, decrypt_header, is_sensitive_header, visible_headers
+from app.security import AuthMiddleware, decrypt_header, is_sensitive_header, sanitized_url, visible_headers
 from app.services import (
     create_job,
     dashboard_data,
@@ -123,7 +123,7 @@ def _jobs_table(jobs, last_runs=None):
             "id": job.id,
             "name": job.name,
             "method": job.method,
-            "url": job.url,
+            "url": sanitized_url(job.url),
             "type": job.schedule_type,
             "schedule": _schedule_text(job),
             "enabled": "Aktiv" if job.enabled else "Pausiert",
@@ -147,6 +147,7 @@ def _jobs_table(jobs, last_runs=None):
     """)
     for job in jobs:
         with ui.row().classes("items-center gap-1"):
+            ui.label(job.name).classes("text-weight-bold")
             ui.button("Bearbeiten", on_click=lambda job_id=job.id: ui.navigate.to(f"/jobs/{job_id}")).props("flat dense")
             ui.button("Starten", on_click=lambda job_id=job.id: _manual_run(job_id)).props("flat dense color=primary")
             ui.button("Pausieren" if job.enabled else "Aktivieren",

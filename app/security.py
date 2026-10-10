@@ -3,7 +3,7 @@ import binascii
 import hashlib
 import hmac
 import ipaddress
-import json
+import logging
 import secrets
 import socket
 import time
@@ -14,6 +14,8 @@ from urllib.parse import urlsplit
 from cryptography.fernet import Fernet, InvalidToken
 
 from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 SECRET_HEADER_MARKER = "enc:v1:"
@@ -159,12 +161,6 @@ def _cookie_value(headers, key: str) -> str:
     return morsel.value if morsel else ""
 
 
-def _response(start, status: int, body: bytes = b"", headers=()):
-    content_headers = [(b"content-type", b"text/plain; charset=utf-8"), (b"content-length", str(len(body)).encode())]
-    content_headers.extend(headers)
-    return start({"type": "http.response.start", "status": status, "headers": content_headers}) and None
-
-
 class AuthMiddleware:
     def __init__(self, app):
         self.app = app
@@ -255,6 +251,9 @@ class AuthMiddleware:
             await send({"type": "http.response.body", "body": b""})
             return
         attempts.append(now)
+        if len(self.login_attempts) >= 5000 and client[0] not in self.login_attempts:
+            oldest = min(self.login_attempts, key=lambda host: self.login_attempts[host][-1])
+            self.login_attempts.pop(oldest, None)
         self.login_attempts[client[0]] = attempts
         body = bytearray()
         while True:
@@ -266,7 +265,10 @@ class AuthMiddleware:
                 return
             if not message.get("more_body", False):
                 break
-        form = parse_qs(body.decode("utf-8", errors="replace"), max_num_fields=10)
+        try:
+            form = parse_qs(body.decode("utf-8", errors="replace"), max_num_fields=10)
+        except ValueError:
+            form = {}
         csrf = form.get("csrf", [""])[0]
         if (
             self._same_origin(scope, headers)
@@ -285,8 +287,40 @@ class AuthMiddleware:
             await send({"type": "http.response.body", "body": b""})
             return
         response = b"Anmeldung fehlgeschlagen. <a href=\"/login\">Erneut versuchen</a>"
+        logger.warning("Authentication failed client=%s", client[0])
         await send({
             "type": "http.response.start", "status": 401,
             "headers": [(b"content-type", b"text/html; charset=utf-8"), (b"content-length", str(len(response)).encode())],
         })
         await send({"type": "http.response.body", "body": response})
+
+
+def sanitized_url(url: str) -> str:
+    try:
+        parts = urlsplit(url)
+        query = []
+        from urllib.parse import parse_qsl, urlencode
+
+        for key, value in parse_qsl(parts.query, keep_blank_values=True):
+            query.append((key, "REDACTED" if any(
+                token in key.lower() for token in ("token", "secret", "password", "key", "auth")
+            ) else value))
+        return parts._replace(query=urlencode(query)).geturl()[:2048]
+    except ValueError:
+        return "ungültig"
+
+
+def redact_response(text: str, headers: dict[str, str], body: str | None, params: dict[str, str]) -> str:
+    secrets_to_hide = [
+        value for key, value in headers.items()
+        if is_sensitive_header(key) and value
+    ]
+    if body:
+        secrets_to_hide.append(body)
+    secrets_to_hide.extend(
+        value for key, value in params.items()
+        if any(token in key.lower() for token in ("token", "secret", "password", "key", "auth")) and value
+    )
+    for secret in secrets_to_hide:
+        text = text.replace(secret, "[REDACTED]")
+    return text

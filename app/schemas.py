@@ -60,7 +60,14 @@ class JobInput(BaseModel):
                     raise ValueError("Ungültiges Intervall.")
                 IntervalTrigger(**{unit: amount}, timezone=zone, start_date=start_date, end_date=end_date)
             elif self.schedule_type == "cron":
-                CronTrigger.from_crontab(config["expression"], timezone=zone, start_date=start_date, end_date=end_date)
+                fields = config["expression"].split()
+                if len(fields) != 5:
+                    raise ValueError("Cron-Ausdrücke müssen fünf Felder enthalten.")
+                CronTrigger(
+                    minute=fields[0], hour=fields[1], day=fields[2],
+                    month=fields[3], day_of_week=fields[4], timezone=zone,
+                    start_date=start_date, end_date=end_date,
+                )
             else:
                 run_at = datetime.fromisoformat(config["run_at"])
                 if run_at.tzinfo is None:
