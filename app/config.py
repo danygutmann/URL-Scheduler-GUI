@@ -27,7 +27,7 @@ class Settings:
     log_retention_days: int
     log_retention_max_runs: int
     allowed_private_targets: tuple[str, ...]
-    response_preview_bytes: int = 4096
+    response_preview_bytes: int = 0
     max_request_body_bytes: int = 65536
 
     @property

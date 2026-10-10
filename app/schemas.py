@@ -1,12 +1,14 @@
 import json
+import re
 from datetime import datetime
 from typing import Literal
+from urllib.parse import parse_qsl, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
 
 class JobInput(BaseModel):
@@ -30,9 +32,35 @@ class JobInput(BaseModel):
 
     @field_validator("headers", "query_params")
     @classmethod
-    def limit_mapping(cls, value):
+    def limit_mapping(cls, value, info: ValidationInfo):
         if len(value) > 50 or any(len(str(k)) > 256 or len(str(v)) > 4096 for k, v in value.items()):
             raise ValueError("Maximal 50 Einträge; Schlüssel und Werte müssen kurz bleiben.")
+        if info.field_name == "headers":
+            for key, item in value.items():
+                if not re.fullmatch(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+", str(key)):
+                    raise ValueError("Ungültiger HTTP-Headername.")
+                if any(ord(char) < 32 and char != "\t" or ord(char) == 127 for char in str(item)):
+                    raise ValueError("HTTP-Headerwerte dürfen keine Steuerzeichen enthalten.")
+                try:
+                    str(item).encode("latin-1")
+                except UnicodeEncodeError as error:
+                    raise ValueError("HTTP-Headerwerte müssen latin-1-kompatibel sein.") from error
+        return value
+
+    @field_validator("url")
+    @classmethod
+    def validate_url_shape(cls, value):
+        try:
+            parts = urlsplit(value)
+            port = parts.port
+        except ValueError as error:
+            raise ValueError("Die URL oder der Zielport ist ungültig.") from error
+        if parts.scheme not in {"http", "https"} or not parts.hostname:
+            raise ValueError("Nur vollständige HTTP- oder HTTPS-URLs sind zulässig.")
+        if parts.username or parts.password or any(ord(char) < 32 for char in value):
+            raise ValueError("URLs mit Zugangsdaten oder Steuerzeichen sind unzulässig.")
+        if port is not None and not 1 <= port <= 65535:
+            raise ValueError("Ungültiger Zielport.")
         return value
 
     @field_validator("timezone")
@@ -42,6 +70,16 @@ class JobInput(BaseModel):
             ZoneInfo(value)
         except ZoneInfoNotFoundError as error:
             raise ValueError("Unbekannte Zeitzone.") from error
+        return value
+
+    @field_validator("url")
+    @classmethod
+    def reject_sensitive_url_parameters(cls, value):
+        if any(
+            any(token in key.lower() for token in ("token", "secret", "password", "key", "auth"))
+            for key, _item in parse_qsl(urlsplit(value).query, keep_blank_values=True)
+        ):
+            raise ValueError("Vertrauliche Werte bitte als geschützte Query-Parameter statt in der URL angeben.")
         return value
 
     @model_validator(mode="after")
@@ -72,6 +110,8 @@ class JobInput(BaseModel):
                 run_at = datetime.fromisoformat(config["run_at"])
                 if run_at.tzinfo is None:
                     run_at = run_at.replace(tzinfo=zone)
+                if run_at <= datetime.now(zone):
+                    raise ValueError("Einmalige Ausführungen müssen in der Zukunft liegen.")
                 if end_date and run_at > end_date:
                     raise ValueError("Der Ausführungszeitpunkt liegt nach dem Ende.")
                 DateTrigger(run_date=run_at, timezone=zone)

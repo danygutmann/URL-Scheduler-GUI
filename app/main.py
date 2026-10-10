@@ -1,5 +1,7 @@
+import json
 import logging
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from fastapi import Request
 from fastapi.responses import PlainTextResponse
@@ -7,18 +9,24 @@ from nicegui import app, ui
 
 from app.config import settings
 from app.database import initialize_database
-from app.http_executor import execute_job
 from app.models import Job
 from app.scheduler import scheduler
 from app.schemas import JobInput
-from app.security import AuthMiddleware, decrypt_header, is_sensitive_header, sanitized_url, visible_headers
+from app.security import (
+    AuthMiddleware,
+    decrypt_header,
+    decrypt_secret,
+    is_sensitive_header,
+    sanitized_url,
+    visible_headers,
+)
 from app.services import (
     create_job,
+    clear_old_runs,
     dashboard_data,
     delete_job,
     duplicate_job,
     get_job,
-    list_jobs,
     list_runs,
     set_job_enabled,
     update_job,
@@ -52,22 +60,26 @@ def _display_time(value):
         return "—"
     if value.tzinfo is None:
         value = value.replace(tzinfo=timezone.utc)
-    return value.astimezone(__import__("zoneinfo").ZoneInfo(settings.timezone)).strftime("%d.%m.%Y %H:%M:%S")
+    return value.astimezone(ZoneInfo(settings.timezone)).strftime("%d.%m.%Y %H:%M:%S")
 
 
-def _job_input(job: Job, form: dict) -> JobInput:
+def _job_input(form: dict, job: Job | None = None) -> JobInput:
     try:
         headers = {}
         if form.get("headers"):
-            headers = __import__("json").loads(form["headers"])
+            headers = json.loads(form["headers"])
         if job:
             existing = dict(job.headers)
             for key, value in existing.items():
                 if is_sensitive_header(key):
                     headers.setdefault(key, decrypt_header(key, value))
-        params = __import__("json").loads(form.get("query_params") or "{}")
-        schedule_config = __import__("json").loads(form.get("schedule_config") or "{}")
-        retry_config = __import__("json").loads(form.get("retry_config") or '{"max_attempts":1,"allow_post":false}')
+        params = json.loads(form.get("query_params") or "{}")
+        if job:
+            for key, value in job.query_params.items():
+                if is_sensitive_header(key):
+                    params.setdefault(key, decrypt_header(key, value))
+        schedule_config = json.loads(form.get("schedule_config") or "{}")
+        retry_config = json.loads(form.get("retry_config") or '{"max_attempts":1,"allow_post":false}')
         return JobInput(
             name=form["name"],
             description=form.get("description", ""),
@@ -168,6 +180,7 @@ def _schedule_text(job):
 
 def _runs_table(runs):
     rows = [{
+        "id": run.id,
         "job": run.job_name_snapshot,
         "trigger": "Manuell" if run.trigger_type == "manual" else "Geplant",
         "started": _display_time(run.started_at),
@@ -186,7 +199,7 @@ def _runs_table(runs):
             )
         ],
         rows=rows,
-        row_key="started",
+        row_key="id",
     ).classes("w-full")
 
 
@@ -257,14 +270,16 @@ def _job_form(job: Job | None):
         "url": job.url if job else "https://",
         "method": job.method if job else "GET",
         "schedule_type": job.schedule_type if job else "interval",
-        "schedule_config": __import__("json").dumps(job.schedule_config if job else {"value": 5, "unit": "minutes"}),
+        "schedule_config": json.dumps(job.schedule_config if job else {"value": 5, "unit": "minutes"}),
         "timezone": job.timezone if job else settings.timezone,
-        "headers": __import__("json").dumps(visible_headers(job.headers) if job else {}, ensure_ascii=False, indent=2),
-        "query_params": __import__("json").dumps(job.query_params if job else {}, ensure_ascii=False, indent=2),
-        "request_body": job.request_body or "" if job else "",
+        "headers": json.dumps(visible_headers(job.headers) if job else {}, ensure_ascii=False, indent=2),
+        "query_params": json.dumps(
+            visible_headers(job.query_params) if job else {}, ensure_ascii=False, indent=2
+        ),
+        "request_body": decrypt_secret(job.request_body) or "" if job else "",
         "body_format": job.body_format if job else "json",
         "timeout_seconds": str(job.timeout_seconds if job else settings.default_timeout_seconds),
-        "retry_config": __import__("json").dumps(job.retry_config if job else {"max_attempts": 1, "allow_post": False}),
+        "retry_config": json.dumps(job.retry_config if job else {"max_attempts": 1, "allow_post": False}),
         "enabled": job.enabled if job else True,
         "allow_parallel": job.allow_parallel if job else False,
     }
@@ -341,7 +356,7 @@ def _job_form(job: Job | None):
                 "url": url.value,
                 "method": method.value,
                 "schedule_type": schedule_type.value,
-                "schedule_config": __import__("json").dumps(schedule_config),
+                "schedule_config": json.dumps(schedule_config),
                 "timezone": timezone.value,
                 "headers": headers.value,
                 "query_params": query_params.value,
@@ -368,8 +383,55 @@ def _job_form(job: Job | None):
 def history_page(request: Request):
     ui.label("Ausführungsprotokoll").classes("text-h4")
     job_id = request.query_params.get("job_id")
-    rows = list_runs(job_id=job_id, limit=1000)
+    status_filter = ui.select(
+        {"Alle": "Alle", "success": "Erfolgreich", "http_error": "HTTP-Fehler",
+         "connection_error": "Verbindungsfehler", "timeout": "Timeout",
+         "configuration_error": "Konfigurationsfehler"},
+        value=request.query_params.get("status", "Alle"),
+        label="Ergebnis filtern",
+    )
+    trigger_filter = ui.select(
+        {"Alle": "Alle", "scheduled": "Geplant", "manual": "Manuell"},
+        value=request.query_params.get("trigger", "Alle"),
+        label="Auslöser filtern",
+    )
+    ui.button("Filter anwenden", on_click=lambda: ui.navigate.to(
+        f"/history?job_id={job_id or ''}&status={status_filter.value}&trigger={trigger_filter.value}"
+    ))
+    ui.button("Alte Protokolle löschen", on_click=_confirm_clear_runs).props("color=negative")
+    rows = list_runs(
+        job_id=job_id,
+        limit=1000,
+        status=status_filter.value,
+        trigger_type=trigger_filter.value,
+    )
     _runs_table(rows)
+
+
+def _confirm_clear_runs():
+    with ui.dialog() as dialog, ui.card():
+        cutoff = ui.input(
+            "Einträge vor diesem Zeitpunkt löschen (lokale Zeit, ISO 8601)",
+            value=datetime.now(ZoneInfo(settings.timezone)).strftime("%Y-%m-%dT%H:%M"),
+        ).classes("w-full")
+        ui.label("Jobkonfigurationen bleiben erhalten.")
+        with ui.row():
+            ui.button("Abbrechen", on_click=dialog.close)
+
+            def clear():
+                try:
+                    date = datetime.fromisoformat(cutoff.value)
+                    if date.tzinfo is None:
+                        date = date.replace(tzinfo=ZoneInfo(settings.timezone))
+                    removed = clear_old_runs(date.astimezone(timezone.utc).replace(tzinfo=None))
+                    dialog.close()
+                    ui.notify(f"{removed} Protokolleinträge gelöscht.", type="positive")
+                    ui.navigate.to("/history")
+                except (TypeError, ValueError) as error:
+                    ui.notify(f"Ungültiger Zeitpunkt: {error}", type="negative")
+
+            ui.button("Löschen", color="negative", on_click=clear)
+    dialog.open()
 
 
 def start():

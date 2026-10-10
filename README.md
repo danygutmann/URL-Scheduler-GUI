@@ -28,7 +28,7 @@ Eine lokal installierte Python-Laufzeit ist für den Dockerbetrieb nicht erforde
 cp .env.example .env
 ```
 
-Erzeuge Zugangsdaten und Schlüssel **vor** dem ersten Start:
+Erzeuge Zugangsdaten und Schlüssel **vor** dem ersten Start. Falls lokal Python und die Abhängigkeiten verfügbar sind:
 
 ```sh
 python -c "import secrets; print(secrets.token_urlsafe(48))"  # APP_SESSION_SECRET
@@ -36,12 +36,16 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 python -c "from app.security import hash_password; print(hash_password('HIER-EIN-LANGES-EINMALIGES-PASSWORT'))"
 ```
 
-Trage die Werte in `.env` ein. Die Passwort-Hash-Zeile setzt voraus, dass Python 3.12 und die Abhängigkeiten verfügbar sind. Ohne lokale Python-Umgebung kann ein Hash mit dem Container erzeugt werden, nachdem Image gebaut wurde:
+Trage die Werte in `.env` ein. Ohne lokale Python-Umgebung kannst du das Image zunächst bauen und die benötigten Werte anschließend im Container erzeugen:
 
 ```sh
 docker compose build
 docker compose run --rm --no-deps --entrypoint python url-scheduler -c \
   "from app.security import hash_password; print(hash_password('HIER-EIN-LANGES-EINMALIGES-PASSWORT'))"
+docker compose run --rm --no-deps --entrypoint python url-scheduler -c \
+  "import secrets; print(secrets.token_urlsafe(48))"
+docker compose run --rm --no-deps --entrypoint python url-scheduler -c \
+  "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 ```
 
 Setze `APP_AUTH_USERNAME`, `APP_AUTH_PASSWORD_HASH`, `APP_SESSION_SECRET` und `APP_ENCRYPTION_KEY` in `.env`. Bewahre diese Werte sicher auf; insbesondere der Verlust des Verschlüsselungsschlüssels macht bereits gespeicherte Geheimheader unlesbar.
@@ -72,13 +76,13 @@ Lege einen Projektordner mit `compose.yaml` und `.env` auf dem NAS an, editiere 
 | `APP_AUTH_USERNAME` | ja bei Auth | — | Anmeldename |
 | `APP_AUTH_PASSWORD_HASH` | ja bei Auth | — | PBKDF2-SHA256-Hash aus `hash_password` |
 | `APP_SESSION_SECRET` | ja bei Auth | — | Zufälliger Schlüssel, mindestens 32 Zeichen |
-| `APP_ENCRYPTION_KEY` | für vertrauliche Header | — | Fernet-Schlüssel, persistent und geheim aufbewahren |
+| `APP_ENCRYPTION_KEY` | für Request-Bodies/vertrauliche Header oder Query-Parameter | — | Fernet-Schlüssel, persistent und geheim aufbewahren |
 | `APP_COOKIE_SECURE` | nein | `false` | `true` bei HTTPS/TLS-Proxy |
 | `MAX_CONCURRENT_JOBS` | nein | `4` | Globale Obergrenze gleichzeitiger Requests |
 | `DEFAULT_TIMEOUT_SECONDS` | nein | `15` | Timeout-Standardwert des Formulars |
 | `LOG_RETENTION_DAYS` | nein | `90` | Einträge älter als diese Zahl löschen; `0` deaktiviert Zeitlimit |
 | `LOG_RETENTION_MAX_RUNS` | nein | `10000` | Höchstzahl gespeicherter Einträge; `0` deaktiviert Anzahllimit |
-| `APP_ALLOWED_PRIVATE_TARGETS` | nein | leer | Ausdrückliche IP-/CIDR-Allowlist für private Ziele, keine Hostnamen |
+| `APP_ALLOWED_PRIVATE_TARGETS` | nein | leer | Ausdrückliche IP-/CIDR-Allowlist für private Ziele (`/24` oder enger bei IPv4, `/64` oder enger bei IPv6), keine Hostnamen |
 | `APP_RESPONSE_PREVIEW_BYTES` | nein | `0` | Maximale Antwortvorschau in Bytes; `0` deaktiviert |
 
 `APP_AUTH_ENABLED=false` ist für Netzwerkbetrieb nicht zulässig. Das Datenverzeichnis und `.env` enthalten vertrauliche Informationen und müssen zugriffsbeschränkt sein.
@@ -99,18 +103,18 @@ Jobs werden nach Neustart aus SQLite wiederhergestellt. Versäumte Termine werde
 
 Unter „Erweiterte HTTP-Einstellungen“ lassen sich Header und Query-Parameter als JSON-Schlüssel/Wert-Objekte einstellen. GET und POST sind verfügbar. Bodies sind nur für POST zugelassen und als JSON oder Text wählbar. Erfolg bedeutet HTTP 200–299. Wiederholungen sind begrenzt; POST wird standardmäßig nie wiederholt. Eine Aktivierung von POST-Retries kann externe Aktionen doppelt ausführen.
 
-Sensible Header (u. a. Authorization, Cookies, API-Schlüssel, Tokens und Passwörter) werden mit Fernet verschlüsselt gespeichert und in Formularen nicht angezeigt. Der Schlüssel liegt in `.env`, also außerhalb der SQLite-Datei, aber nicht in einem dedizierten Secret Store. Schütze Backups und Hostdateien; rotiere den Schlüssel nicht ohne vorherige Migration der gespeicherten Secrets. Headerwerte, Request-Bodies und Antwortvorschauen werden nicht in Container-Logs geschrieben. Antworten werden standardmäßig gar nicht gespeichert; bei Aktivierung wird die Vorschau begrenzt.
+Sensible Header, Request-Bodies sowie vertrauliche Query-Parameter (Schlüssel mit `token`, `secret`, `password`, `key` oder `auth`) werden mit Fernet verschlüsselt gespeichert; vertrauliche Header und Query-Werte werden in Formularen nicht angezeigt. Solche Parameter dürfen nicht direkt in der URL stehen; lege sie als strukturierte Query-Parameter an. Der Schlüssel liegt in `.env`, also außerhalb der SQLite-Datei, aber nicht in einem dedizierten Secret Store. Schütze Backups und Hostdateien; rotiere den Schlüssel nicht ohne vorherige Migration der gespeicherten Geheimnisse. Headerwerte, Request-Bodies und Antwortvorschauen werden nicht in Container-Logs geschrieben. Antworten werden standardmäßig gar nicht gespeichert; bei Aktivierung wird die Vorschau begrenzt.
 
 Redirects werden einzeln verfolgt und erneut geprüft. Umgeleitete Anfrageziele werden aufgelöst und IP-geprüft, die HTTP-Verbindung wird an eine aufgelöste Adresse gebunden. Redirect-Limit: fünf Weiterleitungen.
 
 ## Ausführungsprotokoll
 
-Die Historie zeigt Jobname, Auslöser, Start, Dauer, Status, HTTP-Code und bereinigte Meldung. Historieneinträge bleiben nach Joblöschung über eine nullable Fremdschlüsselbeziehung erhalten. Regelmäßige Bereinigung entfernt alte Runs anhand des Alters und/oder überschüssiger Anzahl; Jobkonfiguration wird dadurch nicht gelöscht. Container-Logs sind separat und enthalten Diagnosedaten ohne Request-Bodies oder Headerwerte.
+Die Historie zeigt Jobname, Auslöser, Start, Dauer, Status, HTTP-Code und bereinigte Meldung; sie kann nach Ergebnis und Auslöser gefiltert werden. Historieneinträge bleiben nach Joblöschung über eine nullable Fremdschlüsselbeziehung erhalten. Die GUI bietet das manuelle Löschen von Einträgen vor einem Stichtag; automatische Bereinigung entfernt alte Runs anhand des Alters und/oder überschüssiger Anzahl. Jobkonfiguration wird dadurch nicht gelöscht. Container-Logs sind separat und enthalten Diagnosedaten ohne Request-Bodies oder Headerwerte.
 
 ## Sicherheitskonzept und Grenzen
 
 - Standardmäßig blockiert: private, Loopback-, Link-local-, nicht spezifizierte, multicast- und reservierte Adressen (IPv4 und IPv6); jeder DNS-Record muss zulässig sein.
-- Private Ziele können nur durch passende IP-/CIDR-Einträge freigegeben werden; DNS-Namen und unbeschränkte `0.0.0.0/0`-Freigaben sind nicht als Zielnamen erlaubt. DNS-Änderungen nach Prüfung ändern die für den Request verwendete IP nicht.
+- Private Ziele können nur durch passende, ausreichend enge IP-/CIDR-Einträge freigegeben werden (z. B. `192.168.1.15` oder `192.168.1.0/24`, `fd12:3456:789a:1::/64`); DNS-Namen, breite Netze und Loopback-/Link-local-/reservierte Ziele lassen sich nicht freigeben. DNS-Änderungen nach Prüfung ändern die für den Request verwendete IP nicht.
 - Zielprüfungen erfolgen auch vor jedem Redirect. HTTP-Proxys aus Umgebungsvariablen werden ignoriert.
 - Login nutzt PBKDF2-Passworthash, zeitbegrenzte signierte HttpOnly-/SameSite-Cookies, Origin-Prüfung für schreibende Requests/WebSockets und begrenzte Loginversuche.
 - Der Container läuft als Nicht-Root, ohne zusätzliche Linux-Capabilities, mit schreibgeschütztem Root-Dateisystem.

@@ -44,8 +44,23 @@ def _fernet() -> Fernet:
         raise ValueError("APP_ENCRYPTION_KEY ist ungültig.") from error
 
 
+def encrypt_secret(value: str | None) -> str | None:
+    if value is None:
+        return None
+    return SECRET_HEADER_MARKER + _fernet().encrypt(value.encode("utf-8")).decode("ascii")
+
+
+def decrypt_secret(value: str | None) -> str | None:
+    if value is None or not value.startswith(SECRET_HEADER_MARKER):
+        return value
+    try:
+        return _fernet().decrypt(value[len(SECRET_HEADER_MARKER):].encode("ascii")).decode("utf-8")
+    except (InvalidToken, UnicodeDecodeError, ValueError) as error:
+        raise ValueError("Ein vertraulicher Wert kann nicht entschlüsselt werden.") from error
+
+
 def encrypt_header(name: str, value: str) -> str:
-    if not is_sensitive_header(name) or value.startswith(SECRET_HEADER_MARKER):
+    if not is_sensitive_header(name):
         return value
     return SECRET_HEADER_MARKER + _fernet().encrypt(value.encode("utf-8")).decode("ascii")
 
@@ -53,10 +68,7 @@ def encrypt_header(name: str, value: str) -> str:
 def decrypt_header(name: str, value: str) -> str:
     if not is_sensitive_header(name) or not value.startswith(SECRET_HEADER_MARKER):
         return value
-    try:
-        return _fernet().decrypt(value[len(SECRET_HEADER_MARKER):].encode("ascii")).decode("utf-8")
-    except (InvalidToken, UnicodeDecodeError, ValueError) as error:
-        raise ValueError("Ein vertraulicher Header kann nicht entschlüsselt werden.") from error
+    return decrypt_secret(value)
 
 
 def visible_headers(headers: dict[str, str]) -> dict[str, str]:
@@ -89,9 +101,13 @@ def _allowed_networks(allowed_private_targets: tuple[str, ...]):
     networks = []
     for value in allowed_private_targets:
         try:
-            networks.append(ipaddress.ip_network(value, strict=False))
+            network = ipaddress.ip_network(value, strict=False)
         except ValueError as error:
             raise ValueError("APP_ALLOWED_PRIVATE_TARGETS muss IP-Adressen oder CIDR-Netze enthalten.") from error
+        minimum_prefix = 24 if network.version == 4 else 64
+        if not network.is_private or network.prefixlen < minimum_prefix:
+            raise ValueError("Allowlist-Ziele müssen private IP-Netze mit mindestens /24 (IPv4) oder /64 (IPv6) sein.")
+        networks.append(network)
     return networks
 
 
@@ -121,7 +137,9 @@ def safe_target(url: str, allowed_private_targets: tuple[str, ...] = ()) -> tupl
         for address in addresses:
             ip = ipaddress.ip_address(address)
             allowed = any(ip.version == network.version and ip in network for network in networks)
-            if not ip.is_global and not allowed:
+            if ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_unspecified or ip.is_reserved:
+                raise ValueError("Loopback-, Link-local- und reservierte Ziele sind gesperrt.")
+            if not ip.is_global and not (ip.is_private and allowed):
                 raise ValueError("Das Ziel ist keine öffentliche IP-Adresse.")
         return hostname, port, tuple(sorted(addresses))
     except (ValueError, OSError, socket.gaierror) as error:

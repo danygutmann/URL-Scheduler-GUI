@@ -1,12 +1,14 @@
 import os
 import tempfile
 
+from cryptography.fernet import Fernet
+
 _temporary_data = tempfile.TemporaryDirectory(prefix="url-scheduler-tests-")
 os.environ.update({
     "APP_AUTH_ENABLED": "false",
     "APP_DATA_DIR": _temporary_data.name,
     "APP_SESSION_SECRET": "test-session-secret-that-is-long-enough",
-    "APP_ENCRYPTION_KEY": "m5HbA1yn-cyp7dMSxP6g8onTTlpVSuaSSUi5Wi7o8q0=",
+    "APP_ENCRYPTION_KEY": Fernet.generate_key().decode(),
     "APP_RESPONSE_PREVIEW_BYTES": "128",
 })
 

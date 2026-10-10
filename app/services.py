@@ -8,7 +8,13 @@ from app.config import settings
 from app.database import session_scope
 from app.models import Job, JobRun
 from app.schemas import JobInput
-from app.security import encrypt_header, is_sensitive_header
+from app.security import (
+    decrypt_header,
+    decrypt_secret,
+    encrypt_header,
+    encrypt_secret,
+    is_sensitive_header,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -32,13 +38,15 @@ def _encoded_headers(headers: dict[str, str], old_headers: dict[str, str] | None
         else:
             result[key] = value
     for key, value in old_secrets.items():
-        result.setdefault(key, encrypt_header(key, value))
+        result.setdefault(key, value)
     return result
 
 
-def _job_values(data: JobInput, old_headers=None):
+def _job_values(data: JobInput, old_headers=None, old_query_params=None):
     values = data.model_dump()
     values["headers"] = _encoded_headers(data.headers, old_headers)
+    values["query_params"] = _encoded_headers(data.query_params, old_query_params)
+    values["request_body"] = encrypt_secret(data.request_body)
     values["updated_at"] = _now()
     return values
 
@@ -58,7 +66,7 @@ def update_job(job_id: str, data: JobInput) -> Job:
         job = session.get(Job, job_id)
         if job is None:
             raise LookupError("Job wurde nicht gefunden.")
-        values = _job_values(data, dict(job.headers))
+        values = _job_values(data, dict(job.headers), dict(job.query_params))
         for key, value in values.items():
             setattr(job, key, value)
     logger.info("Job updated id=%s enabled=%s", job_id, job.enabled)
@@ -113,11 +121,12 @@ def duplicate_job(job_id: str) -> Job:
         schedule_config=dict(source.schedule_config),
         timezone=source.timezone,
         headers={
-            key: value for key, value in source.headers.items()
-            if not is_sensitive_header(key)
+            key: decrypt_header(key, value) for key, value in source.headers.items()
         },
-        query_params=dict(source.query_params),
-        request_body=source.request_body,
+        query_params={
+            key: decrypt_header(key, value) for key, value in source.query_params.items()
+        },
+        request_body=decrypt_secret(source.request_body),
         body_format=source.body_format,
         retry_config=dict(source.retry_config or {"max_attempts": 1, "allow_post": False}),
         timeout_seconds=source.timeout_seconds,
@@ -128,11 +137,20 @@ def duplicate_job(job_id: str) -> Job:
     return clone
 
 
-def list_runs(job_id: str | None = None, limit: int = 500) -> list[JobRun]:
+def list_runs(
+    job_id: str | None = None,
+    limit: int = 500,
+    status: str | None = None,
+    trigger_type: str | None = None,
+) -> list[JobRun]:
     with session_scope() as session:
         query = select(JobRun).order_by(JobRun.started_at.desc(), JobRun.id.desc()).limit(limit)
         if job_id:
             query = query.where(JobRun.job_id == job_id)
+        if status and status != "Alle":
+            query = query.where(JobRun.status == status)
+        if trigger_type and trigger_type != "Alle":
+            query = query.where(JobRun.trigger_type == trigger_type)
         return list(session.scalars(query))
 
 

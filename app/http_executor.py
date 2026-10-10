@@ -14,6 +14,7 @@ from app.database import session_scope
 from app.models import Job, JobRun
 from app.security import (
     decrypt_header,
+    decrypt_secret,
     is_sensitive_header,
     redact_response,
     safe_target,
@@ -108,8 +109,11 @@ def execute_job(job_id: str, trigger_type: str = "scheduled") -> dict:
             return {"status": "configuration_error", "error": "Job wurde nicht gefunden."}
         snapshot = {
             "id": job.id, "name": job.name, "url": job.url, "method": job.method,
-            "headers": dict(job.headers), "query_params": dict(job.query_params),
-            "body": job.request_body, "body_format": job.body_format,
+            "headers": dict(job.headers),
+            "query_params": {
+                key: decrypt_header(key, value) for key, value in job.query_params.items()
+            },
+            "body": decrypt_secret(job.request_body), "body_format": job.body_format,
             "timeout": min(job.timeout_seconds, 300), "allow_parallel": job.allow_parallel,
             "retry_config": dict(job.retry_config or {}),
         }
