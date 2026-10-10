@@ -1,40 +1,23 @@
+# Portainer: Stacks -> Add stack -> Web editor, diesen Inhalt einfügen.
+# Alle Einstellungen stehen unten im Abschnitt "environment" bzw. oben im Build-Kontext.
 services:
   url-scheduler:
     build:
-      context: .
-    image: url-scheduler:local
+      # Git-Download direkt durch Docker (Branch nach '#' anpassen)
+      context: https://github.com/danygutmann/URL-Scheduler-GUI.git#main
+    image: url-scheduler:latest
+    container_name: url-scheduler
     restart: unless-stopped
-    init: true
     ports:
-      - "${APP_BIND_ADDRESS:-127.0.0.1}:${APP_PORT:-8080}:${APP_PORT:-8080}"
-    env_file:
-      - .env
+      - "8080:8080"
     environment:
-      APP_DATA_DIR: /app/data
-    volumes:
-      - scheduler-data:/app/data
-    read_only: true
-    tmpfs:
-      - /tmp:size=32m,noexec,nosuid,nodev
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
-    healthcheck:
-      test:
-        - CMD
-        - python
-        - -c
-        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:'+__import__('os').getenv('APP_PORT','8080')+'/healthz', timeout=3)"
-      interval: 30s
-      timeout: 5s
-      start_period: 30s
-      retries: 3
-    logging:
-      driver: json-file
-      options:
-        max-size: 10m
-        max-file: "3"
-
-volumes:
-  scheduler-data:
+      TZ: Europe/Berlin
+      APP_TIMEZONE: Europe/Berlin
+      # Vorhandener MariaDB-Server (Datenbank und Benutzer vorher anlegen)
+      DB_HOST: 192.168.1.10
+      DB_PORT: "3306"
+      DB_NAME: url_scheduler
+      DB_USER: scheduler
+      DB_PASSWORD: change-me
+      # Optional: erlaubte interne Ziele (IP/CIDR), z.B. 192.168.1.0/24
+      APP_ALLOWED_PRIVATE_TARGETS: ""

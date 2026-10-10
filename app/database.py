@@ -10,14 +10,21 @@ from app.config import settings
 from app.models import Base
 
 settings.data_dir.mkdir(parents=True, exist_ok=True)
-engine = create_engine(settings.database_url, connect_args={"check_same_thread": False})
+_is_sqlite = settings.database_url.startswith("sqlite")
+engine = create_engine(
+    settings.database_url,
+    pool_pre_ping=True,
+    pool_recycle=1800,
+    **({"connect_args": {"check_same_thread": False}} if _is_sqlite else {}),
+)
 
+if _is_sqlite:
 
-@event.listens_for(engine, "connect")
-def _enable_foreign_keys(connection, _record):
-    cursor = connection.cursor()
-    cursor.execute("PRAGMA foreign_keys=ON")
-    cursor.close()
+    @event.listens_for(engine, "connect")
+    def _enable_foreign_keys(connection, _record):
+        cursor = connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
 
 
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)

@@ -47,6 +47,8 @@ def _fernet() -> Fernet:
 def encrypt_secret(value: str | None) -> str | None:
     if value is None:
         return None
+    if not settings.encryption_key:
+        return value
     return SECRET_HEADER_MARKER + _fernet().encrypt(value.encode("utf-8")).decode("ascii")
 
 
@@ -61,6 +63,8 @@ def decrypt_secret(value: str | None) -> str | None:
 
 def encrypt_header(name: str, value: str) -> str:
     if not is_sensitive_header(name):
+        return value
+    if not settings.encryption_key:
         return value
     return SECRET_HEADER_MARKER + _fernet().encrypt(value.encode("utf-8")).decode("ascii")
 
