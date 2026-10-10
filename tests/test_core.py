@@ -9,6 +9,8 @@ from urllib.parse import urlsplit
 
 import httpx
 import pytest
+from alembic import command
+from alembic.config import Config
 
 from app import http_executor, security
 from app.models import Job, JobRun
@@ -320,6 +322,40 @@ def test_retention_deletes_only_old_run_records(db, monkeypatch):
     assert services.prune_runs() == 1
     assert len(list_runs(job.id)) == 1
     assert services.get_job(job.id) is not None
+
+
+def test_initial_migration_upgrades_existing_jobs_table(tmp_path):
+    database_file = tmp_path / "legacy.db"
+    engine = __import__("sqlalchemy").create_engine(f"sqlite:///{database_file}")
+    with engine.begin() as connection:
+        connection.exec_driver_sql("""
+            CREATE TABLE jobs (
+                id VARCHAR(36) PRIMARY KEY, name VARCHAR(120) NOT NULL,
+                description VARCHAR(1000) NOT NULL, url VARCHAR(2048) NOT NULL,
+                method VARCHAR(10) NOT NULL, schedule_type VARCHAR(20) NOT NULL,
+                schedule_config JSON NOT NULL, timezone VARCHAR(80) NOT NULL,
+                headers JSON NOT NULL, query_params JSON NOT NULL, request_body TEXT,
+                body_format VARCHAR(10) NOT NULL, timeout_seconds FLOAT NOT NULL,
+                enabled BOOLEAN NOT NULL, allow_parallel BOOLEAN NOT NULL,
+                created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL
+            )
+        """)
+        connection.exec_driver_sql("""
+            INSERT INTO jobs VALUES (
+                'legacy-id', 'legacy', '', 'https://example.test', 'GET', 'interval',
+                '{"value":5,"unit":"minutes"}', 'Europe/Berlin', '{}', '{}', NULL,
+                'json', 15, 1, 0, '2026-01-01', '2026-01-01'
+            )
+        """)
+    migration_config = Config(str(__import__("pathlib").Path(__file__).parents[1] / "alembic.ini"))
+    migration_config.set_main_option("sqlalchemy.url", f"sqlite:///{database_file}")
+    command.upgrade(migration_config, "head")
+    with engine.connect() as connection:
+        retry_config = connection.exec_driver_sql(
+            "SELECT retry_config FROM jobs WHERE id='legacy-id'"
+        ).scalar()
+        assert retry_config == "{}"
+        assert connection.exec_driver_sql("SELECT count(*) FROM jobs").scalar() == 1
 
 
 def test_authentication_middleware_requires_login_and_issues_session(monkeypatch):

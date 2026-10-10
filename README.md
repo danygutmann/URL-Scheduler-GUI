@@ -145,7 +145,7 @@ docker run --rm -v url-scheduler-gui_scheduler-data:/data -v "$PWD:/backup" alpi
 docker compose start
 ```
 
-Ersetze beim Wiederherstellen das Volume mit einer Kopie des gesicherten Inhalts und stelle die zugehörige `.env` wieder her. Passe bei abweichendem Compose-Projektnamen den Volume-Namen (`docker volume ls`) an. Vor Updates zuerst Datenbank und `.env` sichern; Alembic-Migrationen erweitern das Schema, löschen keine Jobdaten absichtlich.
+Ersetze beim Wiederherstellen das Volume mit einer Kopie des gesicherten Inhalts und stelle die zugehörige `.env` wieder her. Passe bei abweichendem Compose-Projektnamen den Volume-Namen (`docker volume ls`) an. Vor Updates zuerst Datenbank und `.env` sichern; Alembic-Migrationen erweitern das Schema, löschen keine Jobdaten absichtlich. Die Erst-Migration ergänzt auch das neue `retry_config`-Feld in einer bereits vorhandenen Datenbank, ohne bestehende Jobzeilen zu löschen.
 
 ## Diagnose und Tests
 
