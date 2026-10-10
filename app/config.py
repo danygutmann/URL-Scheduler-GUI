@@ -1,6 +1,7 @@
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from sqlalchemy.engine import URL
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
@@ -32,11 +33,26 @@ class Settings:
 
     @property
     def database_url(self) -> str:
+        explicit = os.getenv("APP_DATABASE_URL", "").strip()
+        if explicit:
+            return explicit
+        if os.getenv("DB_HOST"):
+            return str(
+                URL.create(
+                    "mysql+pymysql",
+                    username=os.getenv("DB_USER", "scheduler"),
+                    password=os.getenv("DB_PASSWORD", ""),
+                    host=os.getenv("DB_HOST"),
+                    port=int(os.getenv("DB_PORT", "3306")),
+                    database=os.getenv("DB_NAME", "url_scheduler"),
+                    query={"charset": "utf8mb4"},
+                ).render_as_string(hide_password=False)
+            )
         return f"sqlite:///{self.data_dir / 'scheduler.db'}"
 
     @classmethod
     def from_env(cls) -> "Settings":
-        auth_enabled = _boolean("APP_AUTH_ENABLED", True)
+        auth_enabled = _boolean("APP_AUTH_ENABLED", False)
         username = os.getenv("APP_AUTH_USERNAME", "")
         password_hash = os.getenv("APP_AUTH_PASSWORD_HASH", "")
         session_secret = os.getenv("APP_SESSION_SECRET", "")

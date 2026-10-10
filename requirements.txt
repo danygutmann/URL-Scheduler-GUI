@@ -39,6 +39,7 @@ packaging==24.0
 pluggy==1.6.0
 propcache==0.5.4
 pycparser==3.11
+PyMySQL==1.1.1
 pydantic==2.12.5
 pydantic_core==2.41.5
 Pygments==2.21.0
