@@ -23,6 +23,7 @@ class JobInput(BaseModel):
     query_params: dict[str, str] = Field(default_factory=dict)
     request_body: str | None = Field(default=None, max_length=65536)
     body_format: Literal["json", "text"] = "json"
+    retry_config: dict = Field(default_factory=lambda: {"max_attempts": 1, "allow_post": False})
     timeout_seconds: float = Field(default=15, gt=0, le=300)
     enabled: bool = True
     allow_parallel: bool = False
@@ -48,19 +49,32 @@ class JobInput(BaseModel):
         config = self.schedule_config
         try:
             zone = ZoneInfo(self.timezone)
+            start_date = datetime.fromisoformat(config["start_at"]) if config.get("start_at") else None
+            end_date = datetime.fromisoformat(config["end_at"]) if config.get("end_at") else None
+            if start_date and end_date and end_date <= start_date:
+                raise ValueError("Das Ende muss nach dem Start liegen.")
             if self.schedule_type == "interval":
                 amount = int(config["value"])
                 unit = config["unit"]
                 if amount < 1 or unit not in {"seconds", "minutes", "hours", "days"}:
                     raise ValueError("Ungültiges Intervall.")
-                IntervalTrigger(**{unit: amount}, timezone=zone)
+                IntervalTrigger(**{unit: amount}, timezone=zone, start_date=start_date, end_date=end_date)
             elif self.schedule_type == "cron":
-                CronTrigger.from_crontab(config["expression"], timezone=zone)
+                CronTrigger.from_crontab(config["expression"], timezone=zone, start_date=start_date, end_date=end_date)
             else:
                 run_at = datetime.fromisoformat(config["run_at"])
+                if run_at.tzinfo is None:
+                    run_at = run_at.replace(tzinfo=zone)
+                if end_date and run_at > end_date:
+                    raise ValueError("Der Ausführungszeitpunkt liegt nach dem Ende.")
                 DateTrigger(run_date=run_at, timezone=zone)
         except (KeyError, TypeError, ValueError) as error:
             raise ValueError(f"Ungültiger Zeitplan: {error}") from error
+        attempts = self.retry_config.get("max_attempts", 1)
+        if not isinstance(attempts, int) or not 1 <= attempts <= 5:
+            raise ValueError("Wiederholungen müssen zwischen 1 und 5 Versuchen liegen.")
+        if self.method == "POST" and attempts > 1 and not self.retry_config.get("allow_post", False):
+            self.retry_config = {"max_attempts": 1, "allow_post": False}
         if self.method == "GET" and self.request_body:
             raise ValueError("Ein Request-Body ist nur für POST erlaubt.")
         if self.request_body and self.body_format == "json":

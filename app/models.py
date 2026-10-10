@@ -23,6 +23,7 @@ class Job(Base):
     query_params: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     request_body: Mapped[str | None] = mapped_column(Text)
     body_format: Mapped[str] = mapped_column(String(10), default="json", nullable=False)
+    retry_config: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     timeout_seconds: Mapped[float] = mapped_column(default=15, nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     allow_parallel: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
