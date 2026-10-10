@@ -1,5 +1,8 @@
 from contextlib import contextmanager
+from pathlib import Path
 
+from alembic import command
+from alembic.config import Config
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 
@@ -34,4 +37,6 @@ def session_scope():
 
 
 def initialize_database():
-    Base.metadata.create_all(engine)
+    migration_config = Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))
+    migration_config.set_main_option("sqlalchemy.url", settings.database_url)
+    command.upgrade(migration_config, "head")
